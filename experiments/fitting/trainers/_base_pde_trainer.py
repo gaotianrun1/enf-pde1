@@ -278,6 +278,8 @@ class BasePDETrainer:
             epoch: The current epoch.
         """
         # Check which train step we are using
+        # TODO:这里似乎是先训练了一百步nef，又训练了900步ode
+        # 跟算法写的同步更新θ和φ不太一样，而且这样能训出来吗？？逻辑是什么？
         if self.epoch > self.config.training.nef.train_from_epoch and self.epoch <= self.config.training.nef.train_until_epoch:
             self.train_nef = True
         else:
@@ -289,6 +291,7 @@ class BasePDETrainer:
             self.train_ode = False
 
         # Set the train step
+        # 决定某一个epoch的训练具体优化的是nef还是ode
         if self.train_nef and self.train_ode:
             self.train_step = self.dual_train_step
         elif self.train_nef:

@@ -13,6 +13,9 @@ def chang_xavier_uniform(key, shape, dtype=jnp.float32):
     return jax.random.uniform(key, shape, dtype, -std, std)
 
 class PolynomialFeatures(nn.Module):
+    """
+    用于计算 高阶不变特征（Higher-order Invariant Features），其核心思想是对输入数据 递归地进行外积（Outer Product）
+    """
     degree: int
 
     def setup(self):
@@ -144,6 +147,8 @@ class PonitaGen(nn.Module):
             p = jnp.concatenate((p_pos, jnp.cos(p_angles), jnp.sin(p_angles)), axis=-1)
 
         # Calculate the invariants
+        # 想让一个网络F(x, p)等变，需要F对x, p有bi-invariant性，因此构建了一个双不变量a(x, p)替代以保证双不变性天然成立
+        # 也类似地构建了用于信息传递更新输入的p【也就是pi pj】构成的bi-invariant
         invariants = self.invariant(p, p)
 
         # Get kernel
@@ -156,22 +161,31 @@ class PonitaGen(nn.Module):
         a = self.a_stem(a)
 
         # Apply interaction layers
+        # 应用信息传递层获取前馈的结果，需要输入当前变量a和一个用于信息传递更新的卷积核kernel_basis
+        # 该信息核包含了构建的不变量a(pi,pj)，即论文中的k_context(a_ij)
         for layer in self.interaction_layers:
             a = layer(a, kernel_basis)
 
         # Readout layer, average over all nodes if global
+        # 读出层，用于获取更新后的c
         scalar_out = self.readout_scalar(a)
 
         if self.vec_num_out > 0:
             # Calculate relative positions to other nodes, this is basis for vector output
+            # 在欧氏空间计算pi和pj的相对位置，与切平面中的对数表达形成映射
             rel_pos = p[:, :, None, :self.invariant.num_z_pos_dims] - p[:, None, :, :self.invariant.num_z_pos_dims]
 
             # Concatenate a to the invariants
+            # 和c叠放在一起，其中c已经是经过了利用不变量信息传递的结果，就差一步readout就到最终的c更新结果了
+            # 把c和原本的不变量a叠放在一起是个啥东西？？？经过一步readout_vec_rel相当于直接获得了k_pose(a_ij)cj
+            # 有点相当于把更新出来的c的前置（特征信息），和控制点构成的不变量（几何信息）放在一起用于获取信息传递过程k
             invariants = jnp.concatenate([
                 invariants,
                 jnp.broadcast_to(a[:, None, :, :], invariants.shape[:-1] + (a.shape[-1],))], axis=-1)
 
             readout_vec_rel = self.readout_vec_rel(invariants)
+            # TODO:计算更新后的p，但没找到想象中的切平面如何用exp映射回流形
+            # 感觉跟论文中的式9根本没关系，但是似乎是一个效果？？
             vec_out = (readout_vec_rel * rel_pos).mean(axis=-2)
 
             # If the invariant has orientations, use these as additional basis for the vector output
@@ -189,7 +203,7 @@ class PonitaGen(nn.Module):
             if vec_out is not None:
                 vec_out = vec_out.mean(axis=1)
 
-        return scalar_out, vec_out
+        return scalar_out, vec_out # 标量是context，矢量是控制点pose
 
 
 class PonitaODEGen(nn.Module):

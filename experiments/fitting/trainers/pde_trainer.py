@@ -109,6 +109,7 @@ class MetaSGDPDETrainer(BasePDETrainer):
         _ = self.inner_autodecoder_single_step.init(inner_autodecoder_key)
 
         # Create train state
+        # 包含了oed，nef，autodecoder和metalearningrate四种参数及其优化器
         train_state = self.TrainState(
             params={'nef': nef_params, 'autodecoder': autodecoder_params, 'meta_sgd_lrs': meta_sgd_lrs, 'ode_params': ode_params},
             nef_opt_state=self.nef_opt.init(nef_params),
@@ -122,7 +123,8 @@ class MetaSGDPDETrainer(BasePDETrainer):
     @partial(jax.jit, static_argnums=(0, 4, 5))
     def inner_loop(self, outer_params, outer_state, initial_state, autodecoder, initial_state_dp=0.):
         """Performs the inner loop of the meta learning algorithm.
-
+        这里其实可以输入initial_state，也就是定义一个时刻t0，计算的是这一时刻的损失，而并非一定是0时刻
+        TODO: 似乎不太符合算法中想要在这里学0时刻autodecoder的思路？？
         Args:
             outer_params: The parameters of the outer loop.
             outer_state: The state of the outer loop.
@@ -167,6 +169,7 @@ class MetaSGDPDETrainer(BasePDETrainer):
                         ) * self.config.meta.noise_pos_inner_loop)
 
         # Create inner state
+        # 这个训练中的state包含了其中所有的网络参数、超参数等等状态，表征了训练中的某一个状态下完整的模型训练情况
         inner_state = outer_state.replace(
             params={'nef': outer_params['nef'], 'autodecoder': inner_autodecoder_params,
                     'meta_sgd_lrs': outer_params['meta_sgd_lrs']}
@@ -184,10 +187,11 @@ class MetaSGDPDETrainer(BasePDETrainer):
             out = self.nef.apply(params['nef'], masked_coords, p, a, window)
             return jnp.mean((out - masked_img) ** 2)
 
-        # Create inner grad fn
+        # Create inner grad fn 定义了一个梯度计算器
         inner_grad_fn = jax.grad(loss_fn)
 
         # Do inner loop
+        # 这里才是内部循环中更新autodecoder也就是计算更合理的z0的地方，这里用到的损失和梯度是标准的MSE(v0,f(z0))
         for inner_step in range(self.config.meta.num_inner_steps):
             # Mask the coordinates and labels
             masked_coords = coords[mask[:, inner_step]]
@@ -212,6 +216,7 @@ class MetaSGDPDETrainer(BasePDETrainer):
                     inner_grad['autodecoder']['params']['gaussian_window'])
 
             # Scale inner grads by the learning rates
+            # 根据学习率做梯度下降，更新autodecoder以从v0编码为z0
             inner_autodecoder_updates = jax.tree_util.tree_map_with_path(
                 lambda path, grad: - inner_state.params['meta_sgd_lrs'][path[-1].key] * grad,
                 inner_grad['autodecoder'])
@@ -228,7 +233,7 @@ class MetaSGDPDETrainer(BasePDETrainer):
         # Broadcast the coordinates over the batch dimension
         masked_coords = jnp.broadcast_to(masked_coords, (img.shape[0], *masked_coords.shape))
 
-        return loss_fn(
+        return loss_fn( # 输出的是最终状态下，已经更新过autodecoder后的MSE(v0,f(z0))
                 inner_state.params,
                 masked_coords=masked_coords,
                 masked_img=masked_img,
@@ -252,9 +257,12 @@ class MetaSGDPDETrainer(BasePDETrainer):
         outer_state = state.replace(rng=new_outer_key)
 
         # Calc enf train loss
+        # 这里面的损失及其梯度就是inner_loss，是enf_loss根据输入的外部状态和轨迹给出的
+        # enf_loss根据元学习内循环过程中边对计算z0的autodecoder参数做优化，边计算MSE(v0,f(z0))作为内部损失
         recon_loss, grads = jax.value_and_grad(self.enf_loss)(outer_state.params, outer_state, trajectory)
 
-        # Update enf backbone
+        # Update enf backbone，采用nef优化器，基于刚才算的grads['nef']，对nef参数进行优化并给定更新后的优化器状态
+        # 好像是在根据内循环的损失MSE(v0,f(z0))，哪怕定义初始状态为t0，也没有经过ODE计算出zt与f（vt）之间计算损失用于外部循环训练？
         nef_updates, nef_opt_state = self.nef_opt.update(grads['nef'], state.nef_opt_state, state.params['nef'])
         nef_params = optax.apply_updates(state.params['nef'], nef_updates)
 
@@ -296,6 +304,8 @@ class MetaSGDPDETrainer(BasePDETrainer):
         outer_state = state.replace(rng=new_outer_key)
 
         # Get gradients for the outer loop and update params, gives grads for nef and ode
+        # 这里面的损失及其梯度就是
+        # ode_loss根据元学习内循环过程中边对计算z0的autodecoder参数做优化，边计算MSE(v0,f(z0))作为内部损失
         recon_loss, grads = jax.value_and_grad(self.neural_ode_loss)(outer_state.params, outer_state, trajectory)
 
         # Update ODE model
@@ -411,7 +421,11 @@ class MetaSGDPDETrainer(BasePDETrainer):
     def create_functions(self):
         def ode_loss(params, state, trajectory):
             """Solves the ODE for the given initial latents and trajectory.
-
+            1从输入轨迹 trajectory 获取 t=0 作为初始状态 v₀。
+            2通过 inner_loop 计算初始潜变量 z₀。
+            3使用 ODE 求解器 _solve_latent_ode 计算整个 t=0 到 t=T 轨迹 zₜ。
+            4使用神经场 NeF 计算 f(zₜ) 并重构轨迹 recon。
+            5计算 recon 与 trajectory 之间的 MSE 误差，优化模型。
             Args:
                 state (TrainState): The current training state.
                 batch (dict): The current batch of data.
@@ -423,14 +437,15 @@ class MetaSGDPDETrainer(BasePDETrainer):
             trajectory = trajectory[:, :self.config.dataset.traj_len_train]
 
             # Perform inner loop to get initial latents
+            # 通过内部循环优化出来的autodecodeer从初始状态v0计算z0
             _, last_inner_state = self.inner_loop(params, state, initial_state, self.inner_autodecoder_single_step)
 
             # Obtain initial latents
             p_traj_in, a_traj_in, window_traj_in = self.inner_autodecoder_single_step.apply(last_inner_state.params['autodecoder'])
 
             # Unroll latents for 10 timesteps
-            sol = _solve_latent_ode(
-                f=lambda z, t: self.ode_model.apply(params['ode_params'], z),
+            sol = _solve_latent_ode( # 求解ODE，对ode_model做积分获取从0到T上的z的轨迹数组
+                f=lambda z, t: self.ode_model.apply(params['ode_params'], z), # ode建模了隐变量对时间的导数
                 latents=(p_traj_in,
                          a_traj_in,
                          window_traj_in),
@@ -475,6 +490,7 @@ class MetaSGDPDETrainer(BasePDETrainer):
                 trajectory_m = jnp.reshape(trajectory, (trajectory.shape[0] * trajectory.shape[1], -1, trajectory.shape[-1]))
 
             # Get the output of the NeF
+            # 用nef预测场随着时间的轨迹
             recon = self.nef.apply(params['nef'], coords, p_traj_hat_fl, a_traj_hat_fl, window_traj_hat_fl)
 
             # Compute mse loss
@@ -482,18 +498,21 @@ class MetaSGDPDETrainer(BasePDETrainer):
 
         def nef_loss(params, state, trajectory):
             # Perform inner loop to get initial latents
+            # 但无论针对哪个时刻，都没有用ode做时间推演，只面向这一时刻算损失就用于nef的参数优化
             if self.config.training.nef.fit_on_num_steps == 1:
+                # 仅使用轨迹的第一个时间步 trajectory[:, 0] 作为 gt_state
                 gt_state = trajectory[:, 0]
                 inner_loss, last_inner_state = self.inner_loop(params, state, gt_state, self.inner_autodecoder_single_step)
                 # Obtain initial latents
             else:
-                # Subsample the trajectory
+                # Subsample the trajectory 随机采样多个时间步进行优
+                # 这两者似乎区分了计算的是0时刻的损失还是任意时刻t的损失
                 key, new_key = jax.random.split(state.rng)
                 idx = jax.random.permutation(new_key, jnp.arange(self.config.dataset.traj_len_train))[:self.config.training.nef.fit_on_num_steps]
                 trajectory = trajectory[:, idx]
 
                 gt_state = trajectory.reshape(trajectory.shape[0] * trajectory.shape[1], *trajectory.shape[2:])
-
+                # 这里gt_state其实可以对应了inner_loop的输入initial_state，也就是定义一个时刻t0，计算的是这一时刻的损失
                 inner_loss, last_inner_state = self.inner_loop(params, state, gt_state, self.inner_autodecoder_full_traj)
 
             # Obtain initial latents
