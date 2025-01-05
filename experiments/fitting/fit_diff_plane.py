@@ -1,3 +1,5 @@
+import numpy
+
 import hydra
 from omegaconf import DictConfig
 import omegaconf
